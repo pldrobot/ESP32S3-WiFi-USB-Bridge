@@ -5,6 +5,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <freertos/message_buffer.h>
+#include <atomic>
 
 #ifdef ROLE_TX
 static const bool IS_TX = true;
@@ -25,8 +26,22 @@ static SemaphoreHandle_t s_qMtx, s_sendMtx, s_done;
 static volatile bool s_sendOk;
 static volatile uint32_t s_lastRx, s_lastTx;
 static uint32_t s_nSent, s_nFail;      // stats only; a racy count is fine
-static uint8_t s_seq, s_lastSeq;
-static bool s_haveSeq;
+
+// Sliding window (go-back-N). Frames are numbered 0,1,2..; the wire carries (n % 255) + 1, 0 = ack-only.
+// Every frame also carries the receiver's cumulative ack, so delivery is confirmed by the peer, not the MAC.
+#define WIN     8
+#define MAX_OUT 4                       // ESP-NOW sends outstanding at the radio
+#define RTO_MS  30
+static uint8_t s_fr[WIN][LINK_MTU];
+static uint16_t s_frLen[WIN];
+static volatile uint32_t s_sn, s_acked; // frames built / acknowledged by the peer
+static uint32_t s_snd;                  // next frame to (re)transmit
+static uint32_t s_rn;                   // frames accepted in order from the peer
+static std::atomic<int> s_outCb{0};     // sends whose callback has not run yet
+static volatile bool s_raw, s_ackPending, s_rewind;
+static volatile uint32_t s_gen;         // bumped on every link-up so the sender restarts its window
+static inline uint8_t wire(uint32_t n) { return n % 255 + 1; }
+static inline uint8_t ackWire() { return s_rn ? wire(s_rn - 1) : 0; }
 
 // RX-side pairing state
 enum { ST_SCAN, ST_HELLO };
@@ -46,7 +61,9 @@ static bool sameMac(const uint8_t* a, const uint8_t* b) { return memcmp(a, b, 6)
 // ── ESP-NOW plumbing ─────────────────────────────────────────────────────────
 static void onSent(const esp_now_send_info_t*, esp_now_send_status_t st) {
     s_sendOk = (st == ESP_NOW_SEND_SUCCESS);
-    xSemaphoreGive(s_done);
+    s_outCb--;
+    if (s_raw) xSemaphoreGive(s_done);
+    else if (!s_sendOk) { s_nFail++; s_rewind = true; }     // a data frame failed: resend the window
 }
 
 // WiFi task: only copy [src mac][payload] out.
@@ -58,12 +75,18 @@ static void onRecv(const esp_now_recv_info_t* info, const uint8_t* d, int n) {
     xMessageBufferSend(s_rxq, tmp, 6 + n, 0);
 }
 
-// One frame in flight at a time; true once the peer's MAC acknowledged it.
+// Control frames (beacon, hello, channel switch): drains the data frames first, then sends one and
+// waits for its result. True once the peer's MAC acknowledged it.
 static bool rawSend(const uint8_t* mac, const uint8_t* d, size_t n) {
     xSemaphoreTake(s_sendMtx, portMAX_DELAY);
+    for (uint32_t t = millis(); s_outCb > 0 && millis() - t < 200;) vTaskDelay(1);
     xSemaphoreTake(s_done, 0);
+    s_raw = true;
+    s_outCb++;
     bool ok = false;
-    if (esp_now_send(mac, d, n) == ESP_OK && xSemaphoreTake(s_done, pdMS_TO_TICKS(100)) == pdTRUE) ok = s_sendOk;
+    if (esp_now_send(mac, d, n) == ESP_OK) ok = xSemaphoreTake(s_done, pdMS_TO_TICKS(100)) == pdTRUE && s_sendOk;
+    else s_outCb--;
+    s_raw = false;
     xSemaphoreGive(s_sendMtx);
     return ok;
 }
@@ -87,7 +110,9 @@ static void linkUp(const uint8_t* mac) {
     memcpy(s_peer, mac, 6);
     addPeer(mac, true);
     xMessageBufferReset(s_txq);
-    s_haveSeq = false;
+    s_rn = 0;
+    s_ackPending = false;
+    s_gen++;
     s_lastRx = s_lastTx = millis();
     s_nSent = s_nFail = 0;
     s_lastHop = millis();
@@ -202,18 +227,24 @@ static void handleFrame(const uint8_t* src, const uint8_t* d, int n) {
         }
         break;
     case F_DATA: {
-        if (!s_up || n < 2 || !sameMac(src, s_peer)) break;
+        if (!s_up || n < 3 || !sameMac(src, s_peer)) break;
         s_lastRx = millis();
-        if (s_haveSeq && d[1] == s_lastSeq) break;           // resend of a frame we already processed
-        s_haveSeq = true;
-        s_lastSeq = d[1];
-        int o = 2;
-        while (o + 3 <= n) {
-            uint16_t len = d[o] | (d[o + 1] << 8);
-            if (len < 1 || o + 2 + len > n) break;
-            if (d[o + 2] != M_PING && s_cb) s_cb(d[o + 2], d + o + 3, len - 1);
-            o += 2 + len;
+        uint8_t a = d[2];
+        if (a)                                               // cumulative ack: free what the peer has received
+            for (uint32_t m = s_acked; m < s_sn; m++)
+                if (wire(m) == a) { s_acked = m + 1; break; }
+        if (d[1] == 0) break;                                // ack-only frame
+        if (d[1] == wire(s_rn)) {                            // in order; anything else is a resend or follows a gap
+            s_rn++;
+            int o = 3;
+            while (o + 3 <= n) {
+                uint16_t len = d[o] | (d[o + 1] << 8);
+                if (len < 1 || o + 2 + len > n) break;
+                if (d[o + 2] != M_PING && s_cb) s_cb(d[o + 2], d + o + 3, len - 1);
+                o += 2 + len;
+            }
         }
+        s_ackPending = true;                                 // always answer so the sender learns our position
         break;
     }
     }
@@ -255,36 +286,70 @@ static void rxTask(void*) {
     }
 }
 
-// Packs queued records into frames and resends a frame until the peer MAC acknowledges it.
+static bool radioSend(const uint8_t* d, size_t n) {
+    xSemaphoreTake(s_sendMtx, portMAX_DELAY);
+    s_outCb++;
+    bool ok = esp_now_send(s_peer, d, n) == ESP_OK;
+    if (!ok) s_outCb--;
+    xSemaphoreGive(s_sendMtx);
+    return ok;
+}
+
+// Packs queued records into numbered frames and keeps up to WIN of them in flight. Nothing waits for a
+// callback: frames are freed by the peer's cumulative ack and resent from the oldest unacked one on a
+// MAC failure or after RTO_MS without progress.
 static void sendTask(void*) {
-    static uint8_t fr[LINK_MTU];
+    uint32_t gen = 0, lastSendT = 0;
     for (;;) {
         if (!s_up) { xMessageBufferReset(s_txq); vTaskDelay(pdMS_TO_TICKS(20)); continue; }
-        size_t used = 2;
-        fr[0] = F_DATA;
-        fr[1] = ++s_seq;
-        size_t r = xMessageBufferReceive(s_txq, fr + used + 2, LINK_MTU - used - 2, pdMS_TO_TICKS(50));
-        if (r == 0) {
-            if (millis() - s_lastTx < LINK_PING_MS) continue;
-            fr[used + 2] = M_PING;
-            r = 1;
+        if (gen != s_gen) { gen = s_gen; s_sn = s_acked = s_snd = 0; s_rewind = false; }
+        uint32_t now = millis();
+
+        if (s_sn - s_acked < WIN) {                          // room in the window: build the next frame
+            uint8_t* fr = s_fr[s_sn % WIN];
+            size_t used = 3;
+            size_t r = xMessageBufferReceive(s_txq, fr + used + 2, LINK_MTU - used - 2, 0);
+            if (r == 0 && s_acked == s_sn && now - s_lastTx >= LINK_PING_MS) { fr[used + 2] = M_PING; r = 1; }
+            if (r) {
+                for (;;) {
+                    fr[used] = r & 0xFF;
+                    fr[used + 1] = r >> 8;
+                    used += 2 + r;
+                    r = xMessageBufferReceive(s_txq, fr + used + 2, LINK_MTU - used - 2, 0);
+                    if (r == 0) break;                       // empty, or the next record does not fit
+                }
+                fr[0] = F_DATA;
+                fr[1] = wire(s_sn);
+                s_frLen[s_sn % WIN] = used;
+                s_sn++;
+                if (s_drain) s_drain();
+            }
         }
-        for (;;) {
-            fr[used] = r & 0xFF;
-            fr[used + 1] = r >> 8;
-            used += 2 + r;
-            r = xMessageBufferReceive(s_txq, fr + used + 2, LINK_MTU - used - 2, 0);
-            if (r == 0) break;                                // empty, or the next record does not fit
+
+        if (s_snd < s_acked) s_snd = s_acked;
+        if (s_rewind || (s_acked < s_sn && s_snd == s_sn && now - lastSendT > RTO_MS)) {
+            s_rewind = false;
+            s_snd = s_acked;
+            lastSendT = now;
         }
-        bool ok = false;
-        for (int i = 0; i < LINK_RETRIES && s_up && !ok; i++) {
-            ok = rawSend(s_peer, fr, used);
-            s_nSent++;
-            if (!ok) { s_nFail++; vTaskDelay(1); }
+
+        bool did = false;
+        if (s_snd < s_sn && s_outCb < MAX_OUT) {
+            uint8_t* fr = s_fr[s_snd % WIN];
+            fr[2] = ackWire();
+            if (radioSend(fr, s_frLen[s_snd % WIN])) {
+                s_snd++;
+                s_nSent++;
+                s_ackPending = false;
+                lastSendT = s_lastTx = now;
+                did = true;
+            }
+        } else if (s_ackPending && s_outCb < MAX_OUT) {
+            uint8_t a[3] = {F_DATA, 0, ackWire()};
+            s_ackPending = false;
+            did = radioSend(a, 3);
         }
-        if (ok) s_lastTx = millis();
-        else LOGI("frame dropped after %d tries", LINK_RETRIES);
-        if (s_drain) s_drain();
+        if (!did) vTaskDelay(1);
     }
 }
 

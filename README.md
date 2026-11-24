@@ -31,6 +31,6 @@ exists it tells RX to switch at a countdown instant (at most once every 20 s).
 ## Limits
 
 - Bulk and interrupt endpoints only: no isochronous (audio/video), no hubs, no alternate settings > 0.
-- Throughput is whatever ESP-NOW gives (a few Mbps), not 12 Mbps; fine for serial, HID, small bulk devices.
+- Throughput is whatever ESP-NOW gives (sliding window of 8 frames, 4 sends at the radio), not 12 Mbps; unmeasured so far.
 - ESP-NOW traffic is not encrypted.
 - Control requests cost one WiFi round trip each.
