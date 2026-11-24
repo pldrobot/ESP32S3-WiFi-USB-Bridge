@@ -1,9 +1,9 @@
 # WiFi Direct Bridge
 
-Share a USB device over WiFi, without a router or network infrastructure.
+ESP32-S3 firmware that shares a USB device over WiFi between two boards using ESP-NOW, with automatic pairing and a status LED.
 
-Two ESP32-S3 boards communicate directly over ESP-NOW. The USB device plugs into one board (the host) and the
-other board (the device) plugs into the PC, which then sees the original device as if it were connected locally.
+Plug the USB device into the host board and the device board into the PC. The boards link directly to each
+other, with no router or network infrastructure, and the PC sees the original device as if it were connected locally.
 
 ```
  [USB peripheral] ── Host board  ~~ ESP-NOW ~~  Device board ── [PC]
