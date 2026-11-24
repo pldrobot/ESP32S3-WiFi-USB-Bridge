@@ -1,8 +1,8 @@
 # WiFi Direct Bridge
 
-ESP32-S3 firmware that shares a USB device over WiFi between two boards using ESP-NOW, with automatic pairing and a status LED.
+ESP32-S3 firmware that shares a USB device over WiFi between two nodes using ESP-NOW.
 
-Plug the USB device into the host board and the device board into the PC. The boards link directly to each
+Plug the USB device into the host node and the device node into the PC. The nodes link directly to each
 other, with no router or network infrastructure, and the PC sees the original device as if it were connected locally.
 
 ```
