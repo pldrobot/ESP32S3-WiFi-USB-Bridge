@@ -8,7 +8,7 @@
 //   OUT data  : one packet at a time to the TX, paced by credits
 // Standard device requests (SET_ADDRESS, SET_CONFIGURATION, GET_DESCRIPTOR config) are TinyUSB's own.
 #include "config.h"
-#ifdef ROLE_RX
+#ifdef ROLE_DEVICE
 #include "bridge.h"
 #include "link.h"
 #include "proto.h"
@@ -308,6 +308,8 @@ void usb_poll() {
         LOGI("USB device disconnected from the PC");
     }
 }
+
+bool usb_present() { return g_attached; }
 
 void usb_begin() {
     g_ctrlSem = xSemaphoreCreateBinary();

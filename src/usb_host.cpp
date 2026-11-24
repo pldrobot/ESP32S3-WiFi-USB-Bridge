@@ -5,7 +5,7 @@
 // IN endpoints are read ahead one packet per transfer, so packet boundaries (short packets, ZLPs)
 // reach the RX exactly as the device sent them.
 #include "config.h"
-#ifdef ROLE_TX
+#ifdef ROLE_HOST
 #include "bridge.h"
 #include "link.h"
 #include "proto.h"
@@ -341,6 +341,8 @@ void usb_on_msg(uint8_t type, const uint8_t* p, uint16_t len) {
 }
 
 void usb_poll() {}
+
+bool usb_present() { return g_ready; }
 
 void usb_begin() {
     g_mtx = xSemaphoreCreateMutex();

@@ -6,19 +6,26 @@
 #include <esp_wifi.h>
 #include <freertos/message_buffer.h>
 #include <atomic>
+#include <Preferences.h>
+#include <nvs_flash.h>
 
-#ifdef ROLE_TX
-static const bool IS_TX = true;
+#ifdef ROLE_HOST
+static const bool IS_HOST = true;
 #else
-static const bool IS_TX = false;
+static const bool IS_HOST = false;
 #endif
 
 static const uint8_t BCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-static const uint32_t KEY = PAIR_KEY;
 
 static LinkMsgCb s_cb;
 static void (*s_drain)();
 static uint8_t s_peer[6];
+static uint8_t s_pair[6];                     // peer MAC stored in NVS
+static bool s_paired;                         // false = pairing mode: pair with the nearest unpaired device
+static int8_t s_candRssi;                     // RX pairing sweep: strongest beacon heard so far
+static uint8_t s_candMac[6], s_candCh;
+static bool s_cand;
+static volatile uint32_t s_pairT;             // while millis() < this, report PAIRING (the handshake itself is only ms long)
 static volatile bool s_up;
 static volatile uint8_t s_chan = 1;
 static MessageBufferHandle_t s_txq, s_rxq;
@@ -66,13 +73,14 @@ static void onSent(const esp_now_send_info_t*, esp_now_send_status_t st) {
     else if (!s_sendOk) { s_nFail++; s_rewind = true; }     // a data frame failed: resend the window
 }
 
-// WiFi task: only copy [src mac][payload] out.
+// WiFi task: only copy [src mac][rssi][payload] out.
 static void onRecv(const esp_now_recv_info_t* info, const uint8_t* d, int n) {
     if (n < 1 || n > 1500) return;
-    uint8_t tmp[6 + 1500];
+    uint8_t tmp[7 + 1500];
     memcpy(tmp, info->src_addr, 6);
-    memcpy(tmp + 6, d, n);
-    xMessageBufferSend(s_rxq, tmp, 6 + n, 0);
+    tmp[6] = (uint8_t)info->rx_ctrl->rssi;
+    memcpy(tmp + 7, d, n);
+    xMessageBufferSend(s_rxq, tmp, 7 + n, 0);
 }
 
 // Control frames (beacon, hello, channel switch): drains the data frames first, then sends one and
@@ -112,11 +120,21 @@ static void linkUp(const uint8_t* mac) {
     xMessageBufferReset(s_txq);
     s_rn = 0;
     s_ackPending = false;
-    s_gen++;
-    s_lastRx = s_lastTx = millis();
+    s_gen = s_gen + 1;
+    s_lastRx = millis();
+    s_lastTx = s_lastRx;
     s_nSent = s_nFail = 0;
     s_lastHop = millis();
     s_up = true;
+    if (!s_paired || !sameMac(mac, s_pair)) {
+        memcpy(s_pair, mac, 6);
+        s_paired = true;
+        Preferences p;
+        p.begin("bridge", false);
+        p.putBytes("peer", s_pair, 6);
+        p.end();
+        LOGI("paired, stored in NVS");
+    }
     LOGI("link UP, peer %02X:%02X:%02X:%02X:%02X:%02X, channel %u", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], s_chan);
     emit(M_LINK_UP);
 }
@@ -155,13 +173,11 @@ static uint8_t bestChannel(const int* score) {
 // Move both ends to `ch`: the countdown in each CHSW lets the RX switch at the same instant.
 static void hopTo(uint8_t ch) {
     LOGI("channel %u -> %u", s_chan, ch);
-    uint8_t f[8] = {F_CHSW};
-    memcpy(f + 1, &KEY, 4);
-    f[5] = ch;
+    uint8_t f[4] = {F_CHSW, ch};
     for (int i = 0; i < 5; i++) {
         uint16_t rem = 100 - i * 20;
-        memcpy(f + 6, &rem, 2);
-        rawSend(s_peer, f, 8);
+        memcpy(f + 2, &rem, 2);
+        rawSend(s_peer, f, 4);
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     setChannel(ch);
@@ -184,45 +200,52 @@ static void maybeHop() {
 }
 
 // ── Frame handling (rx task) ─────────────────────────────────────────────────
-static bool keyOk(const uint8_t* d) {
-    uint32_t k;
-    memcpy(&k, d, 4);
-    return k == KEY;
+// A paired device only talks to its stored peer; an unpaired one accepts anybody.
+static bool peerOk(const uint8_t* src) { return !s_paired || sameMac(src, s_pair); }
+
+static void sendHello(const uint8_t* mac, uint8_t ch) {
+    if (!s_paired) s_pairT = millis() + 2000;
+    setChannel(ch);
+    addPeer(mac, false);
+    uint8_t f[1] = {F_HELLO};
+    memcpy(s_peer, mac, 6);
+    rawSend(mac, f, 1);
+    s_state = ST_HELLO;
+    s_stateT = millis();
 }
 
-static void handleFrame(const uint8_t* src, const uint8_t* d, int n) {
+static void handleFrame(const uint8_t* src, const uint8_t* d, int n, int8_t rssi) {
     switch (d[0]) {
     case F_BEACON:
-        if (!IS_TX && !s_up && s_state == ST_SCAN && n >= 6 && keyOk(d + 1)) {
-            setChannel(d[5]);
-            addPeer(src, false);
-            uint8_t f[5] = {F_HELLO};
-            memcpy(f + 1, &KEY, 4);
-            memcpy(s_peer, src, 6);
-            rawSend(src, f, 5);
-            s_state = ST_HELLO;
-            s_stateT = millis();
+        if (IS_HOST || s_up || s_state != ST_SCAN || n < 3) break;
+        if (s_paired) {
+            if (d[2] && sameMac(src, s_pair)) sendHello(src, d[1]);
+        } else if (!d[2] && (!s_cand || rssi > s_candRssi)) {   // pairing mode: remember the strongest unpaired TX
+            s_cand = true;
+            s_candRssi = rssi;
+            s_candCh = d[1];
+            memcpy(s_candMac, src, 6);
         }
         break;
     case F_HELLO:
-        if (IS_TX && n >= 5 && keyOk(d + 1) && (!s_up || sameMac(src, s_peer))) {
+        if (IS_HOST && peerOk(src) && (!s_up || sameMac(src, s_peer))) {
+            if (!s_paired) s_pairT = millis() + 2000;
             addPeer(src, false);
-            uint8_t f[5] = {F_ACCEPT};
-            memcpy(f + 1, &KEY, 4);
-            rawSend(src, f, 5);
+            uint8_t f[1] = {F_ACCEPT};
+            rawSend(src, f, 1);
             if (s_up) { s_up = false; emit(M_LINK_DOWN); }   // peer restarted: start a clean session
             linkUp(src);
         }
         break;
     case F_ACCEPT:
-        if (!IS_TX && !s_up && s_state == ST_HELLO && n >= 5 && sameMac(src, s_peer) && keyOk(d + 1))
+        if (!IS_HOST && !s_up && s_state == ST_HELLO && sameMac(src, s_peer))
             linkUp(src);
         break;
     case F_CHSW:
-        if (!IS_TX && s_up && n >= 8 && sameMac(src, s_peer) && keyOk(d + 1)) {
+        if (!IS_HOST && s_up && n >= 4 && sameMac(src, s_peer)) {
             uint16_t rem;
-            memcpy(&rem, d + 6, 2);
-            s_hopCh = d[5];
+            memcpy(&rem, d + 2, 2);
+            s_hopCh = d[1];
             s_hopAt = millis() + rem;
         }
         break;
@@ -252,15 +275,13 @@ static void handleFrame(const uint8_t* src, const uint8_t* d, int n) {
 
 static void housekeeping() {
     uint32_t now = millis();
-    if (IS_TX) {
+    if (IS_HOST) {
         if (!s_up) {
             static uint32_t t;
             if (now - t >= 100) {
                 t = now;
-                uint8_t f[6] = {F_BEACON};
-                memcpy(f + 1, &KEY, 4);
-                f[5] = s_chan;
-                rawSend(BCAST, f, 6);
+                uint8_t f[3] = {F_BEACON, s_chan, s_paired};
+                rawSend(BCAST, f, 3);
             }
         } else if (now - s_lastRx > LINK_TIMEOUT_MS) linkDown("timeout");
         else maybeHop();
@@ -272,16 +293,20 @@ static void housekeeping() {
             if (now - s_stateT > 300) { esp_now_del_peer(s_peer); s_state = ST_SCAN; s_stateT = now; }
         } else if (now - s_stateT >= 110) {              // listen ~110 ms per channel; TX beacons every 100 ms
             s_stateT = now;
-            setChannel(s_chan % CH_MAX + 1);
+            if (s_chan == CH_MAX && s_cand) {            // sweep done: pair with the strongest unpaired TX heard
+                s_cand = false;
+                LOGI("pairing with the nearest TX (rssi %d)", s_candRssi);
+                sendHello(s_candMac, s_candCh);
+            } else setChannel(s_chan % CH_MAX + 1);
         }
     }
 }
 
 static void rxTask(void*) {
-    static uint8_t buf[6 + 1500];
+    static uint8_t buf[7 + 1500];
     for (;;) {
         size_t n = xMessageBufferReceive(s_rxq, buf, sizeof buf, pdMS_TO_TICKS(10));
-        if (n >= 7) handleFrame(buf, buf + 6, n - 6);
+        if (n >= 8) handleFrame(buf, buf + 7, n - 7, (int8_t)buf[6]);
         housekeeping();
     }
 }
@@ -302,7 +327,7 @@ static void sendTask(void*) {
     uint32_t gen = 0, lastSendT = 0;
     for (;;) {
         if (!s_up) { xMessageBufferReset(s_txq); vTaskDelay(pdMS_TO_TICKS(20)); continue; }
-        if (gen != s_gen) { gen = s_gen; s_sn = s_acked = s_snd = 0; s_rewind = false; }
+        if (gen != s_gen) { gen = s_gen; s_sn = 0; s_acked = 0; s_snd = 0; s_rewind = false; }
         uint32_t now = millis();
 
         if (s_sn - s_acked < WIN) {                          // room in the window: build the next frame
@@ -321,7 +346,7 @@ static void sendTask(void*) {
                 fr[0] = F_DATA;
                 fr[1] = wire(s_sn);
                 s_frLen[s_sn % WIN] = used;
-                s_sn++;
+                s_sn = s_sn + 1;
                 if (s_drain) s_drain();
             }
         }
@@ -341,7 +366,8 @@ static void sendTask(void*) {
                 s_snd++;
                 s_nSent++;
                 s_ackPending = false;
-                lastSendT = s_lastTx = now;
+                lastSendT = now;
+                s_lastTx = now;
                 did = true;
             }
         } else if (s_ackPending && s_outCb < MAX_OUT) {
@@ -362,13 +388,20 @@ void link_begin(LinkMsgCb cb) {
     s_sendMtx = xSemaphoreCreateMutex();
     s_done = xSemaphoreCreateBinary();
 
+    Preferences p;
+    p.begin("bridge", false);
+    s_paired = p.getBytes("peer", s_pair, 6) == 6;
+    p.end();
+    if (s_paired) LOGI("paired with %02X:%02X:%02X:%02X:%02X:%02X", s_pair[0], s_pair[1], s_pair[2], s_pair[3], s_pair[4], s_pair[5]);
+    else LOGI("unpaired: pairing mode");
+
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     uint8_t ch = 1;
-    if (IS_TX) {
+    if (IS_HOST) {
         int score[CH_MAX + 1];
         scanScores(score);
         ch = bestChannel(score);
@@ -377,8 +410,8 @@ void link_begin(LinkMsgCb cb) {
     if (esp_now_init() != ESP_OK) { LOGI("esp_now_init failed"); return; }
     esp_now_register_send_cb(onSent);
     esp_now_register_recv_cb(onRecv);
-    if (IS_TX) addPeer(BCAST, false);
-    LOGI("%s link ready on channel %u, MAC %s", IS_TX ? "TX" : "RX", s_chan, WiFi.macAddress().c_str());
+    if (IS_HOST) addPeer(BCAST, false);
+    LOGI("%s link ready on channel %u, MAC %s", IS_HOST ? "TX" : "RX", s_chan, WiFi.macAddress().c_str());
 
     xTaskCreatePinnedToCore(rxTask, "link_rx", 6144, nullptr, 6, nullptr, 0);
     xTaskCreatePinnedToCore(sendTask, "link_tx", 4096, nullptr, 6, nullptr, 0);
@@ -402,4 +435,23 @@ bool link_send(uint8_t type, const void* a, uint16_t la, const void* b, uint16_t
         xSemaphoreGive(s_qMtx);
     }
     return ok;
+}
+
+void link_poll_button() {
+    static uint32_t down;
+    if (digitalRead(BTN_PIN) == LOW) {
+        if (!down) down = millis();
+        if (millis() - down < BTN_HOLD_MS) return;
+        LOGI("button held: erasing NVS, release to reboot");
+        while (digitalRead(BTN_PIN) == LOW) delay(10);   // rebooting with BOOT held would enter the ROM downloader
+        nvs_flash_erase();
+        ESP.restart();
+    }
+    down = 0;
+}
+
+LinkState link_state() {
+    if ((int32_t)(s_pairT - millis()) > 0) return LS_PAIRING;
+    if (s_up) return LS_CONNECTED;
+    return s_paired ? LS_SEARCHING : LS_AVAILABLE;
 }

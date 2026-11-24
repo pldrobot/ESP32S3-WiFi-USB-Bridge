@@ -1,36 +1,91 @@
-# ESP32S3-WiFi-USB-Bridge
+# WiFi Direct Bridge
 
-Extends a USB device over WiFi using two ESP32-S3 boards and no router.
+Share a USB device over WiFi, without a router or network infrastructure.
+
+Two ESP32-S3 boards communicate directly over ESP-NOW. The USB device plugs into one board (the host) and the
+other board (the device) plugs into the PC, which then sees the original device as if it were connected locally.
 
 ```
- [USB peripheral] -- ESP "TX" (USB host)  ~~ ESP-NOW ~~  ESP "RX" (USB device) -- [PC]
+ [USB peripheral] ── Host board  ~~ ESP-NOW ~~  Device board ── [PC]
 ```
 
-- **TX** is the USB host: plug the real peripheral into its OTG port.
-- **RX** is the USB device: plug it into the PC. It copies the peripheral's descriptors and relays
-  control, bulk and interrupt traffic, so the PC sees the original device (full speed, 12 Mbps bus on both ends).
-- One code base; the role is picked by the PlatformIO environment.
+| Role | Function |
+|------|----------|
+| Host | Acts as the USB host. The peripheral connects to its OTG port. |
+| Device | Acts as a USB device. It mirrors the peripheral's descriptors and relays control, bulk and interrupt transfers to it. |
 
-| env | board | role |
-|-----|-------|------|
-| `n16r8_tx` / `n16r8_rx` | ESP32-S3-N16R8 DevKitC-1 | host / device |
-| `supermini_tx` / `supermini_rx` | ESP32-S3 Super Mini (4 MB) | host / device |
+Both boards run at USB full speed (12 Mbps).
 
-Use the **OTG** USB-C port for the USB side. Logs are on UART0 (GPIO43/44, 115200), not USB.
-On the Super Mini the single USB-C port is the OTG port: hold BOOT while plugging in to re-flash.
+## Supported devices
 
-## Pairing and channel
+Both modes support:
 
-No buttons. TX scans for the quietest 2.4 GHz channel at boot and broadcasts a beacon on it. RX hops
-channels 1-13 until it hears a beacon with the same `PAIR_KEY` (platformio.ini), replies, and the link is up.
-Change `PAIR_KEY` to keep several bridges apart. If the link drops, RX goes back to scanning.
+- HID: keyboards, mice, gamepads, barcode scanners
+- CDC serial and USB-serial adapters (FTDI, CP210x, CH340), including programmers and debug probes
+- Printers and other vendor-specific devices
 
-While running, TX counts failed frames. Above 15 % over 2 s it rescans, and if a clearly quieter channel
-exists it tells RX to switch at a countdown instant (at most once every 20 s).
+Not supported: isochronous devices (webcams, audio) and hubs. These device classes are expected to work but have not yet been tested.
 
-## Limits
+## Hardware
 
-- Bulk and interrupt endpoints only: no isochronous (audio/video), no hubs, no alternate settings > 0.
-- Throughput is whatever ESP-NOW gives (sliding window of 8 frames, 4 sends at the radio), not 12 Mbps; unmeasured so far.
+- ESP32-S3-N16R8 DevKitC-1
+- ESP32-S3 Super Mini (4 MB)
+
+Connect the USB side to the board's **OTG** USB-C port. Both boards use the on-board WS2812 LED on GPIO48.
+Firmware logs are written to UART0 (GPIO43/44, 115200 baud), not over USB.
+
+On the Super Mini the single USB-C port is the OTG port. Hold BOOT while plugging in to re-flash.
+
+## Build and flash
+
+Requires [PlatformIO](https://platformio.org/). Set `upload_port` and `monitor_port` in `platformio.ini`, then:
+
+```
+pio run -e host_n16r8 -t upload
+pio run -e host_supermini -t upload
+pio run -e device_n16r8 -t upload
+pio run -e device_supermini -t upload
+```
+
+Serial monitor (replace the environment as needed):
+
+```
+pio device monitor -e host_n16r8
+```
+
+## Pairing
+
+A new or erased board starts in pairing mode. The host selects the quietest 2.4 GHz channel and advertises on it.
+The device scans channels 1-13 and pairs with the strongest (nearest) unpaired host. Both boards then store the
+peer's MAC address in NVS and only communicate with each other. If the link drops, the device resumes scanning but
+accepts only its paired host.
+
+To re-pair, hold **BOOT (GPIO0) for 3 seconds on both boards**, then release. NVS is erased and the board reboots
+into pairing mode. Keep both boards close together and away from other unpaired bridges while pairing.
+
+## LED status
+
+| Status | LED |
+|--------|-----|
+| Available to pair | Blue, slow blink |
+| Pairing | Blue, fast blink |
+| Searching (paired, peer not found) | Green, slow blink |
+| Connected | Green, solid |
+| Connected, no USB device | Red, solid |
+
+## Channel management
+
+The host monitors the failure rate of transmitted frames. If more than 15 % fail over a 2-second window, it scans
+for a quieter channel and, if one is clearly better, instructs the device to switch at a synchronised instant
+(at most once every 20 seconds).
+
+## Limitations
+
+- Control, bulk and interrupt endpoints only: no isochronous transfers, hubs or alternate settings above 0.
+- Throughput is limited by ESP-NOW (8-frame sliding window, 4 sends outstanding at the radio), not by USB full speed. It has not been measured yet.
 - ESP-NOW traffic is not encrypted.
-- Control requests cost one WiFi round trip each.
+- Each control request costs one WiFi round trip.
+
+## TODO
+
+- Mass storage (flash drives, card readers) does not work yet. Investigate and fix.

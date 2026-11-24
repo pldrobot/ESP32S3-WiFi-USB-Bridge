@@ -3,10 +3,10 @@
 
 // Frame types (first byte of every ESP-NOW payload)
 enum : uint8_t {
-    F_BEACON = 0xB0,   // TX -> broadcast  [type][key u32][channel]
-    F_HELLO  = 0xB1,   // RX -> TX         [type][key u32]
-    F_ACCEPT = 0xB2,   // TX -> RX         [type][key u32]
-    F_CHSW   = 0xB3,   // TX -> RX         [type][key u32][channel][remaining ms u16]
+    F_BEACON = 0xB0,   // TX -> broadcast  [type][channel][paired u8]
+    F_HELLO  = 0xB1,   // RX -> TX         [type]
+    F_ACCEPT = 0xB2,   // TX -> RX         [type]
+    F_CHSW   = 0xB3,   // TX -> RX         [type][channel][remaining ms u16]
     F_DATA   = 0xD0,   // both             [type][seq] then records
 };
 

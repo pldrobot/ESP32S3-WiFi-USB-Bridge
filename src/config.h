@@ -1,13 +1,12 @@
 #pragma once
 #include <Arduino.h>
 
-#if defined(ROLE_TX) == defined(ROLE_RX)
-#error "Define exactly one of ROLE_TX (USB host side) or ROLE_RX (USB device side)"
+#if defined(ROLE_HOST) == defined(ROLE_DEVICE)
+#error "Define exactly one of ROLE_HOST (USB host side) or ROLE_DEVICE (USB device side)"
 #endif
 
-#ifndef PAIR_KEY
-#define PAIR_KEY 0x50444C31u
-#endif
+#define BTN_PIN           0                   // BOOT button: hold to erase NVS (forget the peer) and reboot
+#define BTN_HOLD_MS       3000
 
 // ESP-NOW v2 payload limit is 1470; keep room for the frame header.
 #define LINK_MTU          1400

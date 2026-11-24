@@ -1,8 +1,9 @@
 #pragma once
 #include <stdint.h>
 
-// Role-specific USB side (usb_tx.cpp = USB host, usb_rx.cpp = USB device).
+// Role-specific USB side (usb_host.cpp = USB host, usb_device.cpp = USB device).
 void usb_begin();
+bool usb_present();    // host: peripheral plugged in. device: the host reports a peripheral.
 void usb_poll();                                                 // Arduino loop task, every ~20 ms
 void usb_on_msg(uint8_t type, const uint8_t* p, uint16_t len);   // link rx task
 
